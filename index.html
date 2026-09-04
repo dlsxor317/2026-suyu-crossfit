@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>크로스핏 WOD 기록</title>
+<style>
+  body{font-family:sans-serif;padding:20px;max-width:600px;margin:auto;background:#fafafa;color:#222;}
+  h2{margin-bottom:4px;}
+  .nav{margin:16px 0;}
+  .nav button{display:inline-block;padding:8px 16px;margin-right:8px;border:none;border-radius:6px;background:#eee;color:#333;font-size:15px;cursor:pointer;}
+  .nav button.active{background:#4CAF50;color:white;}
+  input[type=text]{font-size:16px;padding:8px;margin-right:8px;border:1px solid #ccc;border-radius:6px;}
+  button.submit{font-size:16px;padding:8px 16px;background:#4CAF50;color:white;border:none;border-radius:6px;cursor:pointer;}
+  table{width:100%;border-collapse:collapse;margin-top:16px;background:white;}
+  th,td{border:1px solid #ddd;padding:8px;text-align:center;font-size:14px;}
+  th{background:#4CAF50;color:white;}
+  tr:nth-child(odd){background:#f9f9f9;}
+  .total{font-size:18px;margin-top:12px;}
+  .msg{color:#666;}
+  .loading{color:#888;font-size:14px;}
+</style>
+</head>
+<body>
+  <h2>🏋️ 크로스핏 WOD 기록</h2>
+  <div class="nav">
+    <button id="btnLookup" class="active">내 기록 조회</button>
+    <button id="btnClass">반별 순위</button>
+    <button id="btnTeam">조편성</button>
+    <button id="btnAll">전체순위(교사용)</button>
+  </div>
+  <div id="content"><p class="loading">불러오는 중...</p></div>
+
+<script>
+// ===== 설정: 여기 두 링크만 나중에 바꾸면 됩니다 =====
+var RESPONSE_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQtszfqJJRbtOZAFk96SnrCYGDk6-YtjRApP8eBvwhs8A-HnFWtMsMOoAZqWIEUv1DIvwPHwgsNu2BN/pub?gid=933854400&single=true&output=csv";
+var SESSION_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQtszfqJJRbtOZAFk96SnrCYGDk6-YtjRApP8eBvwhs8A-HnFWtMsMOoAZqWIEUv1DIvwPHwgsNu2BN/pub?gid=128671562&single=true&output=csv";
+
+var BASE_POINT = 50;
+var GRADE_BONUS = [50, 40, 30, 20, 10];
+
+var COL_SESSION = "오늘의 크로스핏 차시";
+var COL_STUDENT_ID = "학번";
+var COL_NAME = "이름";
+var COL_GENDER = "성별";
+var COL_FOR_TIME = "오늘의 수행기록(FOR TIME)";
+var COL_AMRAP = "오늘의 수행기록(AMRAP / EMOM)";
+var TEAM_PASSWORD = "240500";
+var adminUnlocked = false;
+
+var currentView = 'lookup';
+var responseRows = null;
+var sessionInfo = null;
+
+// ---- 간단한 CSV 파서 (따옴표 안의 콤마/줄바꿈 처리) ----
+function parseCSV(text) {
+  var rows = [];
+  var row = [];
+  var field = '';
+  var inQuotes = false;
+  for (var i = 0; i < text.length; i++) {
+    var c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i+1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else { field += c; }
+    } else {
+      if (c === '"') { inQuotes = true; }
+      else if (c === ',') { row.push(field); field = ''; }
+      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+      else if (c === '\r') { /* skip */ }
+      else { field += c; }
+    }
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function csvToObjects(text) {
+  var rows = parseCSV(text);
+  if (rows.length === 0) return [];
+  var headers = rows[0];
+  var out = [];
+  for (var i = 1; i < rows.length; i++) {
+    if (rows[i].length === 1 && rows[i][0] === '') continue;
+    var obj = {};
+    for (var j = 0; j < headers.length; j++) obj[headers[j]] = rows[i][j] || '';
+    out.push(obj);
+  }
+  return out;
+}
+
+function parseDuration(v) {
+  if (!v) return null;
+  var parts = v.toString().trim().split(':').map(Number);
+  if (parts.some(isNaN)) return null;
+  if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
+  if (parts.length === 2) return parts[0]*60 + parts[1];
+  return null;
+}
+
+function parseRoundsReps(v) {
+  if (!v) return null;
+  var m = v.toString().trim().match(/^(\d+)\+(\d+)$/);
+  if (!m) return null;
+  return { rounds: parseInt(m[1],10), reps: parseInt(m[2],10) };
+}
+
+function getClassFromId(id) {
+  var s = (id || '').toString().trim();
+  if (s.length !== 5) return '알수없음';
+  return s.substring(1,3) + '반';
+}
+
+function getGrade(rank, total) {
+  var g = Math.ceil(rank * 5 / total);
+  if (g < 1) g = 1;
+  if (g > 5) g = 5;
+  return g;
+}
+
+function getRankingData(session) {
+  var recordType = sessionInfo.info[session];
+  var rows = [];
+  responseRows.forEach(function(r) {
+    var rowSession = (r[COL_SESSION] || '').trim();
+    if (rowSession !== session) return;
+    var studentId = (r[COL_STUDENT_ID] || '').trim();
+    if (!studentId) return;
+    var entry = { studentId: studentId, name: r[COL_NAME], class: getClassFromId(studentId) };
+    if (recordType === '시간') {
+      var sec = parseDuration(r[COL_FOR_TIME]);
+      if (sec === null || sec === 0) return;
+      entry.seconds = sec;
+      entry.display = r[COL_FOR_TIME];
+    } else if (recordType === '반복수') {
+      var rr = parseRoundsReps(r[COL_AMRAP]);
+      if (!rr) return;
+      entry.rounds = rr.rounds;
+      entry.reps = rr.reps;
+      entry.display = rr.rounds + '라운드 + ' + rr.reps + '개';
+    } else { return; }
+    rows.push(entry);
+  });
+  if (recordType === '시간') rows.sort(function(a,b){ return a.seconds - b.seconds; });
+  else if (recordType === '반복수') rows.sort(function(a,b){ if (b.rounds!==a.rounds) return b.rounds-a.rounds; return b.reps-a.reps; });
+
+  // 동점자(타이) 처리: 기록이 완전히 같으면 같은 순위(공동 등수) 부여
+  function isSameRecord(a, b) {
+    if (recordType === '시간') return a.seconds === b.seconds;
+    if (recordType === '반복수') return a.rounds === b.rounds && a.reps === b.reps;
+    return false;
+  }
+  var rank = 1;
+  for (var i = 0; i < rows.length; i++) {
+    if (i > 0 && isSameRecord(rows[i], rows[i-1])) {
+      rows[i].rank = rows[i-1].rank; // 이전 학생과 기록이 같으면 같은 순위
+    } else {
+      rows[i].rank = i + 1; // 새로운 순위 (건너뛴 순위 포함, 공동순위 표준 방식)
+    }
+  }
+  return rows;
+}
+
+function computeAllStudentScores() {
+  var students = {};
+  sessionInfo.order.forEach(function(session) {
+    var ranked = getRankingData(session);
+    var n = ranked.length;
+    ranked.forEach(function(r) {
+      var rank = r.rank;
+      var grade = getGrade(rank, n);
+      var point = BASE_POINT + GRADE_BONUS[grade-1];
+      var key = r.studentId;
+      if (!students[key]) students[key] = { studentId: r.studentId, name: r.name, class: r.class, total: 0, count: 0, records: [] };
+      students[key].total += point;
+      students[key].count += 1;
+      students[key].records.push({ session: session, display: r.display, rank: rank, sessionTotal: n, grade: grade, point: point });
+    });
+  });
+
+  // 전체 학생 누적 점수 기준 순위 계산 (동점자는 공동 순위)
+  var list = Object.keys(students).map(function(k){ return students[k]; });
+  list.sort(function(a,b){ return b.total - a.total; });
+  var overallTotal = list.length;
+  list.forEach(function(s, idx) {
+    if (idx > 0 && list[idx-1].total === s.total) {
+      s.overallRank = list[idx-1].overallRank;
+    } else {
+      s.overallRank = idx + 1;
+    }
+    s.overallTotalStudents = overallTotal;
+  });
+
+  return students;
+}
+
+function escapeHtml(s) {
+  return (s || '').toString().replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+function getGenderMap() {
+  var map = {};
+  responseRows.forEach(function(r) {
+    var id = (r[COL_STUDENT_ID] || '').trim();
+    var g = (r[COL_GENDER] || '').trim();
+    if (id && g) map[id] = g;
+  });
+  return map;
+}
+
+function getAllClasses() {
+  var students = computeAllStudentScores();
+  var set = {};
+  Object.keys(students).forEach(function(k){ set[students[k].class] = true; });
+  return Object.keys(set).sort();
+}
+
+// 스네이크 드래프트: 점수 내림차순 리스트를 받아, 팀 실력이 고르게 되도록 순서대로 배분
+function snakeDraftTeams(sortedList, teamSize) {
+  if (sortedList.length === 0) return [];
+  var numTeams = Math.max(1, Math.round(sortedList.length / teamSize));
+  var teams = [];
+  for (var i = 0; i < numTeams; i++) teams.push([]);
+  var order = [];
+  var forward = true;
+  while (order.length < sortedList.length) {
+    var seq = [];
+    if (forward) { for (var t = 0; t < numTeams; t++) seq.push(t); }
+    else { for (var t2 = numTeams - 1; t2 >= 0; t2--) seq.push(t2); }
+    order = order.concat(seq);
+    forward = !forward;
+  }
+  order = order.slice(0, sortedList.length);
+  sortedList.forEach(function(s, i) { teams[order[i]].push(s); });
+  return teams;
+}
+
+// 남/여 리스트를 점수 순으로 번갈아 섞기 (혼성 모드용) - 성별이 최대한 섞이도록
+function interleaveByGender(male, female) {
+  var result = [];
+  var i = 0, j = 0;
+  while (i < male.length || j < female.length) {
+    if (i < male.length) result.push(male[i++]);
+    if (j < female.length) result.push(female[j++]);
+  }
+  return result;
+}
+
+function buildTeams(className, teamSize, mode) {
+  var students = computeAllStudentScores();
+  var genderMap = getGenderMap();
+  var pool = Object.keys(students).map(function(k){ return students[k]; })
+    .filter(function(s){ return s.class === className; })
+    .map(function(s){ return { studentId: s.studentId, name: s.name, total: s.total, gender: genderMap[s.studentId] || '?' }; });
+
+  var teams;
+  if (mode === 'same') {
+    var male = pool.filter(function(s){ return s.gender === '남'; }).sort(function(a,b){ return b.total - a.total; });
+    var female = pool.filter(function(s){ return s.gender === '여'; }).sort(function(a,b){ return b.total - a.total; });
+    var etc = pool.filter(function(s){ return s.gender !== '남' && s.gender !== '여'; }).sort(function(a,b){ return b.total - a.total; });
+    teams = snakeDraftTeams(male, teamSize).concat(snakeDraftTeams(female, teamSize)).concat(snakeDraftTeams(etc, teamSize));
+  } else if (mode === 'mixed') {
+    var m2 = pool.filter(function(s){ return s.gender === '남'; }).sort(function(a,b){ return b.total - a.total; });
+    var f2 = pool.filter(function(s){ return s.gender === '여'; }).sort(function(a,b){ return b.total - a.total; });
+    var mixedList = interleaveByGender(m2, f2);
+    teams = snakeDraftTeams(mixedList, teamSize);
+  } else {
+    var randomPool = pool.slice().sort(function(a,b){ return b.total - a.total; });
+    teams = snakeDraftTeams(randomPool, teamSize);
+  }
+  return teams.filter(function(t){ return t.length > 0; });
+}
+
+function renderLookup(studentId) {
+  var el = document.getElementById('content');
+  var html = '<form id="lookupForm"><input type="text" id="idInput" placeholder="학번 5자리 입력" value="' + escapeHtml(studentId||'') + '"><button type="submit" class="submit">조회</button></form>';
+  if (!studentId) {
+    html += '<p class="msg">본인 학번(5자리)을 입력하면 나의 기록만 확인할 수 있어요.</p>';
+  } else {
+    var students = computeAllStudentScores();
+    var s = students[studentId.trim()];
+    if (!s) {
+      html += '<p class="msg">해당 학번의 기록을 찾을 수 없어요. 학번을 다시 확인해주세요.</p>';
+    } else {
+      var rowsHtml = s.records.map(function(r) {
+        return '<tr><td>' + escapeHtml(r.session) + '</td><td>' + escapeHtml(r.display) + '</td><td>' + r.rank + '위 / ' + r.sessionTotal + '명</td><td>' + r.grade + '등급</td><td>' + r.point + '점</td></tr>';
+      }).join('');
+      html += '<h3>' + escapeHtml(s.name) + ' 학생 (' + s.class + ')</h3>'
+        + '<table><tr><th>차시</th><th>기록</th><th>순위</th><th>등급</th><th>점수</th></tr>' + rowsHtml + '</table>'
+        + '<p class="total">누적 점수: <b>' + s.total + '점</b> (참여 ' + s.count + '회)</p>'
+        + '<p class="total">전체 누적 순위: <b>' + s.overallRank + '위</b> / ' + s.overallTotalStudents + '명 중</p>';
+    }
+  }
+  el.innerHTML = html;
+  document.getElementById('lookupForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    renderLookup(document.getElementById('idInput').value);
+  });
+}
+
+// 차시마다 반끼리 순위를 매겨 점수를 부여하고 누적 (결석/부상 학생이 반 평균을 계속 깎는 문제 해결용)
+function classRankPoints(rank) {
+  if (rank === 1) return 10;
+  if (rank === 2) return 9;
+  if (rank === 3) return 8;
+  if (rank === 4) return 7;
+  return 6; // 5등 이하는 전부 6점
+}
+
+function computeClassSessionScores() {
+  var classPoints = {}; // class -> 누적 점수
+
+  sessionInfo.order.forEach(function(session) {
+    var ranked = getRankingData(session); // 그 차시 참여자만
+    var n = ranked.length;
+    if (n === 0) return;
+
+    // 그 차시 참여자들의 개인 점수(참여+등급보너스)를 반별로 평균
+    var classSum = {}, classCount = {};
+    ranked.forEach(function(r) {
+      var grade = getGrade(r.rank, n);
+      var point = BASE_POINT + GRADE_BONUS[grade - 1];
+      if (!classSum[r.class]) { classSum[r.class] = 0; classCount[r.class] = 0; }
+      classSum[r.class] += point;
+      classCount[r.class] += 1;
+    });
+
+    var classAvgList = Object.keys(classSum).map(function(cls) {
+      return { class: cls, avg: classSum[cls] / classCount[cls] };
+    });
+    classAvgList.sort(function(a,b){ return b.avg - a.avg; });
+
+    // 동점 반은 공동 순위 처리
+    var rank = 1;
+    classAvgList.forEach(function(c, idx) {
+      if (idx > 0 && classAvgList[idx-1].avg === c.avg) {
+        c.rank = classAvgList[idx-1].rank;
+      } else {
+        c.rank = idx + 1;
+      }
+      var pts = classRankPoints(c.rank);
+      if (!classPoints[c.class]) classPoints[c.class] = 0;
+      classPoints[c.class] += pts;
+    });
+  });
+
+  return classPoints;
+}
+
+function renderClass() {
+  var el = document.getElementById('content');
+  var students = computeAllStudentScores();
+
+  // 기존 방식: 개인 누적점수를 반별로 평균 (참고용으로 함께 표시)
+  var classTotals = {};
+  Object.keys(students).forEach(function(key) {
+    var s = students[key];
+    if (!classTotals[s.class]) classTotals[s.class] = { sum: 0, count: 0 };
+    classTotals[s.class].sum += s.total;
+    classTotals[s.class].count += 1;
+  });
+
+  // 새 방식: 차시별 반 순위 점수 누적
+  var classSessionPoints = computeClassSessionScores();
+
+  var list = Object.keys(classTotals).map(function(cls) {
+    var avg = classTotals[cls].sum / classTotals[cls].count;
+    return { class: cls, avg: Math.round(avg*10)/10, sessionPoints: classSessionPoints[cls] || 0 };
+  });
+  list.sort(function(a,b){ return b.sessionPoints - a.sessionPoints; });
+
+  var rowsHtml = list.map(function(r, idx) {
+    return '<tr><td>' + (idx+1) + '</td><td>' + r.class + '</td><td>' + r.sessionPoints + '점</td><td>' + r.avg + '점</td></tr>';
+  }).join('');
+  el.innerHTML = '<table><tr><th>순위</th><th>반</th><th>차시별 순위 누적점수</th><th>개인 평균 누적점수(참고)</th></tr>' + rowsHtml + '</table>';
+}
+
+function renderTeam() {
+  var el = document.getElementById('content');
+  if (!adminUnlocked) {
+    el.innerHTML = '<form id="pwForm"><input type="text" id="pwInput" placeholder="비밀번호 입력"><button type="submit" class="submit">확인</button></form><p class="msg" id="pwMsg"></p>';
+    document.getElementById('pwForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var pw = document.getElementById('pwInput').value;
+      if (pw === TEAM_PASSWORD) {
+        adminUnlocked = true;
+        renderTeam();
+      } else {
+        document.getElementById('pwMsg').textContent = '비밀번호가 틀렸어요.';
+      }
+    });
+    return;
+  }
+
+  var classes = getAllClasses();
+  var classOptions = classes.map(function(c){ return '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>'; }).join('');
+
+  el.innerHTML =
+    '<form id="teamForm">' +
+    '<div style="margin-bottom:10px;">반: <select id="classSelect">' + classOptions + '</select></div>' +
+    '<div style="margin-bottom:10px;">조 인원수: ' +
+    '<label><input type="radio" name="teamSize" value="2" checked> 2인 1조</label> ' +
+    '<label><input type="radio" name="teamSize" value="3"> 3인 1조</label></div>' +
+    '<div style="margin-bottom:10px;">방식: ' +
+    '<label><input type="radio" name="mode" value="same" checked> 동성끼리</label> ' +
+    '<label><input type="radio" name="mode" value="mixed"> 혼성끼리</label> ' +
+    '<label><input type="radio" name="mode" value="random"> 랜덤</label></div>' +
+    '<button type="submit" class="submit">조 편성하기</button>' +
+    '</form><div id="teamResult"></div>';
+
+  document.getElementById('teamForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    var className = document.getElementById('classSelect').value;
+    var teamSize = parseInt(document.querySelector('input[name=teamSize]:checked').value, 10);
+    var mode = document.querySelector('input[name=mode]:checked').value;
+    var teams = buildTeams(className, teamSize, mode);
+    var html = '';
+    teams.forEach(function(team, idx) {
+      var members = team.map(function(m){ return escapeHtml(m.name); }).join(', ');
+      html += '<tr><td>' + (idx+1) + '조</td><td>' + members + '</td></tr>';
+    });
+    document.getElementById('teamResult').innerHTML =
+      '<table><tr><th>조</th><th>구성원</th></tr>' + html + '</table>';
+  });
+}
+
+function renderAllRank() {
+  var el = document.getElementById('content');
+  if (!adminUnlocked) {
+    el.innerHTML = '<form id="pwForm2"><input type="text" id="pwInput2" placeholder="비밀번호 입력"><button type="submit" class="submit">확인</button></form><p class="msg" id="pwMsg2"></p>';
+    document.getElementById('pwForm2').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var pw = document.getElementById('pwInput2').value;
+      if (pw === TEAM_PASSWORD) {
+        adminUnlocked = true;
+        renderAllRank();
+      } else {
+        document.getElementById('pwMsg2').textContent = '비밀번호가 틀렸어요.';
+      }
+    });
+    return;
+  }
+
+  var students = computeAllStudentScores();
+  var list = Object.keys(students).map(function(k){ return students[k]; });
+  list.sort(function(a,b){ return b.total - a.total; });
+  var rowsHtml = list.map(function(s) {
+    return '<tr><td>' + s.overallRank + '</td><td>' + s.class + '</td><td>' + escapeHtml(s.studentId) + '</td><td>' + escapeHtml(s.name) + '</td><td>' + s.total + '점</td><td>' + s.count + '회</td></tr>';
+  }).join('');
+  el.innerHTML = '<table><tr><th>순위</th><th>반</th><th>학번</th><th>이름</th><th>누적점수</th><th>참여차시</th></tr>' + rowsHtml + '</table>';
+}
+
+
+function render() {
+  document.getElementById('btnLookup').className = currentView === 'lookup' ? 'active' : '';
+  document.getElementById('btnClass').className = currentView === 'class' ? 'active' : '';
+  document.getElementById('btnTeam').className = currentView === 'team' ? 'active' : '';
+  document.getElementById('btnAll').className = currentView === 'all' ? 'active' : '';
+  if (currentView === 'lookup') renderLookup('');
+  else if (currentView === 'class') renderClass();
+  else if (currentView === 'team') renderTeam();
+  else renderAllRank();
+}
+
+document.getElementById('btnLookup').addEventListener('click', function(){ currentView='lookup'; render(); });
+document.getElementById('btnClass').addEventListener('click', function(){ currentView='class'; render(); });
+document.getElementById('btnTeam').addEventListener('click', function(){ currentView='team'; render(); });
+document.getElementById('btnAll').addEventListener('click', function(){ currentView='all'; render(); });
+
+function loadSessionInfo(text) {
+  var rows = csvToObjects(text);
+  var info = {}, order = [];
+  rows.forEach(function(r) {
+    var name = (r['차시'] || '').trim();
+    var type = (r['기록방식'] || '').trim();
+    if (name) { info[name] = type; order.push(name); }
+  });
+  return { info: info, order: order };
+}
+
+Promise.all([
+  fetch(RESPONSE_CSV_URL).then(function(r){ return r.text(); }),
+  fetch(SESSION_CSV_URL).then(function(r){ return r.text(); })
+]).then(function(results) {
+  responseRows = csvToObjects(results[0]);
+  sessionInfo = loadSessionInfo(results[1]);
+  render();
+}).catch(function(err) {
+  document.getElementById('content').innerHTML = '<p class="msg">데이터를 불러오지 못했어요. 인터넷 연결을 확인해주세요.<br><small>' + escapeHtml(err.message) + '</small></p>';
+});
+</script>
+</body>
+</html>
